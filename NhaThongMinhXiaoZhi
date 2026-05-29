@@ -1,0 +1,151 @@
+#define BLYNK_TEMPLATE_ID   "TMPL6fWLcLvcZ"
+#define BLYNK_TEMPLATE_NAME "DieuKhienRelay"
+#define BLYNK_AUTH_TOKEN    "FwFxsT58AVf263MCT48fMxBoq7m9w6Ho"
+
+#define APP_KEY    "dfc885d9-dea1-45ea-8a6f-5cb0c4804139"
+#define APP_SECRET "11a568f5-4031-497c-a35b-129e6925cc8c-f401d1d7-1e2c-4cec-80ed-18803e0b3177"
+#define ID_DEN     "69d7f5c0c1c259380d92b76d"
+#define ID_QUAT    "69f03a43a221de78793f637d"
+#define ID_CUA     "69f03a7752800e7ce371d9c3"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <SinricPro.h>
+#include <SinricProSwitch.h>
+#include <WebSocketMCP.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+
+const int PIN_DEN = 5;   
+const int PIN_QUAT = 18; 
+const int PIN_CUA = 19;  
+const int PIN_CB_HONGNGOAI = 4; 
+
+Servo servoCua; 
+char ssid[] = "PRO";
+char pass[] = "12344567";
+
+WebSocketMCP mcpClient;
+
+bool currentDoorState = false; 
+bool isAutoMode = true; // Trạng thái bật/tắt cảm biến tự động
+
+void setDoor(bool state) {
+  currentDoorState = state; 
+
+  if (state) {
+    Serial.println("Dang mo cua -> Quay den goc 100 do.");
+    servoCua.write(100);  
+  } else {
+    Serial.println("Dang dong cua -> Quay ve goc 0 do.");
+    servoCua.write(0);    
+  }
+  
+  if (Blynk.connected()) Blynk.virtualWrite(V3, state ? 1 : 0);
+  SinricProSwitch &myDoor = SinricPro[ID_CUA];
+  myDoor.sendPowerStateEvent(state);
+}
+
+void setFanPower(bool state) {
+  digitalWrite(PIN_QUAT, state ? HIGH : LOW);
+  Serial.print("Quat: "); Serial.println(state ? "BAT" : "TAT");
+  if (Blynk.connected()) Blynk.virtualWrite(V2, state ? 1 : 0);
+  SinricProSwitch &myFan = SinricPro[ID_QUAT];
+  myFan.sendPowerStateEvent(state);
+}
+
+// Hàm xử lý bật tắt Chế độ tự động riêng biệt
+void setAutoMode(bool state) {
+  isAutoMode = state;
+  Serial.print("Che do cam bien tu dong: "); 
+  Serial.println(isAutoMode ? "BAT" : "TAT");
+  if (Blynk.connected()) Blynk.virtualWrite(V4, state ? 1 : 0); // Cập nhật lại nút V4 trên Blynk
+}
+
+// --- HÀM CẬP NHẬT TRẠNG THÁI CHUNG CHÍNH ---
+void updateDevice(String device, bool state) {
+  if (device == "den") {
+    digitalWrite(PIN_DEN, state ? HIGH : LOW);
+    Serial.print("Den: "); Serial.println(state ? "BAT" : "TAT");
+    if (Blynk.connected()) Blynk.virtualWrite(V1, state ? 1 : 0);
+    SinricProSwitch &myLight = SinricPro[ID_DEN];
+    myLight.sendPowerStateEvent(state);
+  } else if (device == "quat") {
+    setFanPower(state);
+  } else if (device == "cua") { 
+    // Khi cố tình ra lệnh Ép đóng/mở cửa bằng tay -> Tạm tắt tự động để tránh xung đột
+    setAutoMode(false); 
+    setDoor(state);
+  } else if (device == "cam_bien") { // TÍCH HỢP MỚI: Điều khiển chế độ tự động
+    setAutoMode(state);
+  }
+}
+
+// Blynk Callbacks
+BLYNK_WRITE(V1) { updateDevice("den", param.asInt()); }
+BLYNK_WRITE(V2) { updateDevice("quat", param.asInt()); }
+BLYNK_WRITE(V3) { updateDevice("cua", param.asInt()); } 
+BLYNK_WRITE(V4) { setAutoMode(param.asInt()); } // Đồng bộ nút V4 từ app Blynk
+
+// Sinric Pro Callbacks
+bool onPowerStateDen(const String &id, bool &s) { updateDevice("den", s); return true; }
+bool onPowerStateQuat(const String &id, bool &s) { setFanPower(s); return true; }
+bool onPowerStateCua(const String &id, bool &s) { updateDevice("cua", s); return true; } 
+
+// Đăng ký công cụ điều khiển với AI Xiaozhi
+void registerMcpTools() {
+  mcpClient.registerTool(
+    "smart_home",
+    "Dieu khien den, quat, cua va che do tu dong cua cam bien.", // Cập nhật mô tả cho AI hiểu
+    "{\"type\":\"object\",\"properties\":{\"device\":{\"type\":\"string\",\"enum\":[\"den\",\"quat\",\"cua\",\"cam_bien\"]},\"action\":{\"type\":\"string\",\"enum\":[\"on\",\"off\"]}}}", // THÊM "cam_bien" vào danh sách lệnh AI
+    [](const String& args) {
+      DynamicJsonDocument doc(256);
+      deserializeJson(doc, args);
+      updateDevice(doc["device"], doc["action"] == "on");
+      return WebSocketMCP::ToolResponse("{\"status\":\"success\"}");
+    }
+  );
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_DEN, OUTPUT); 
+  pinMode(PIN_QUAT, OUTPUT); 
+  pinMode(PIN_CB_HONGNGOAI, INPUT); 
+  
+  digitalWrite(PIN_DEN, LOW);
+  digitalWrite(PIN_QUAT, LOW);
+  
+  servoCua.attach(PIN_CUA, 500, 2400); 
+  servoCua.write(0); 
+
+  WiFi.begin(ssid, pass);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  
+  SinricProSwitch &den = SinricPro[ID_DEN]; den.onPowerState(onPowerStateDen);
+  SinricProSwitch &quat = SinricPro[ID_QUAT]; quat.onPowerState(onPowerStateQuat);
+  SinricProSwitch &cua = SinricPro[ID_CUA]; cua.onPowerState(onPowerStateCua); 
+  
+  SinricPro.begin(APP_KEY, APP_SECRET);
+  mcpClient.begin("wss://api.xiaozhi.me/mcp/?token=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjg5ODM3OCwiYWdlbnRJZCI6MTcwNjk2NSwiZW5kcG9pbnRJZCI6ImFnZW50XzE3MDY5NjUiLCJwdXJwb3NlIjoibWNwLWVuZHBvaW50IiwiaWF0IjoxNzgwMDA3MzE5LCJleHAiOjE4MTE1NjQ5MTl9.-wMUmvuacl9wsmHGylUle0zr7dGnJ6ARFZSa6LSvO9rL6wVFF3DkLmwDkVUgpWEIJdi9K9CGKqaJU8z-mr9SOA", [](bool c){ if(c) registerMcpTools(); });
+}
+
+void loop() {
+  Blynk.run();
+  SinricPro.handle();
+  mcpClient.loop();
+
+  // Chỉ đọc cảm biến nếu chế độ tự động đang BẬT
+  if (isAutoMode) {
+    int sensorState = digitalRead(PIN_CB_HONGNGOAI);
+
+    if (sensorState == LOW && currentDoorState == false) {
+      Serial.println("-> Phat hien nguoi den gan! Tu dong mo cua...");
+      setDoor(true);
+    } 
+    else if (sensorState == HIGH && currentDoorState == true) {
+      Serial.println("-> Khong con nguoi! Tu dong dong cua...");
+      setDoor(false);
+    }
+  }
+}
